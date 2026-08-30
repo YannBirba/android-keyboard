@@ -31,6 +31,7 @@ import org.futo.inputmethod.latin.settings.SettingsValuesForSuggestion;
 import org.futo.inputmethod.latin.utils.AutoCorrectionUtils;
 import org.futo.inputmethod.latin.utils.BinaryDictionaryUtils;
 import org.futo.inputmethod.latin.utils.SuggestionResults;
+import org.futo.inputmethod.latin.xlm.FrenchHomographRules;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -333,11 +334,38 @@ public final class Suggest {
                 settingsValuesForSuggestion, SESSION_ID_TYPING, inputStyleIfNotPrediction);
         final Locale locale = mDictionaryFacilitator.getPrimaryLocale();
 
+        addFrenchHomographCorrectionIfNeeded(suggestionResults, wordComposer, ngramContext);
+
         callback.onGetSuggestedWords(
             obtainNonBatchedInputSuggestedWords(wordComposer, inputStyleIfNotPrediction,
                 isCorrectionEnabled, sequenceNumber, locale, suggestionResults, mAutoCorrectionThreshold,
                     keyboard.mId.mNumberRow)
         );
+    }
+
+    /**
+     * Injects a high-priority whitelist suggestion for the unambiguous French homographs
+     * {@code a -> à} and {@code ou -> où}. Runs on the plain dictionary path (every typing
+     * suggestion update), complementing the transformer-aware injection in
+     * {@link org.futo.inputmethod.latin.xlm.LanguageModelFacilitator} which only fires when the
+     * transformer result lands within the suggestion window.
+     */
+    private void addFrenchHomographCorrectionIfNeeded(final SuggestionResults suggestionResults,
+            final WordComposer wordComposer, final NgramContext ngramContext) {
+        final Locale activeLocale = mDictionaryFacilitator.getMostConfidentLocale();
+        final String typedWord = wordComposer.getTypedWord();
+        final String[] prevWords = ngramContext.extractPrevWordsContextArray();
+        if(null == activeLocale || !"fr".equals(activeLocale.getLanguage())) return;
+        if(prevWords.length == 0) return;
+
+        final String accentedTarget = FrenchHomographRules.apply(typedWord, prevWords);
+        if(accentedTarget == null) return;
+
+        suggestionResults.add(new SuggestedWordInfo(accentedTarget,
+                ngramContext.extractPrevWordsContext(), SuggestedWordInfo.MAX_SCORE,
+                SuggestedWordInfo.KIND_WHITELIST
+                        | SuggestedWordInfo.KIND_FLAG_APPROPRIATE_FOR_AUTO_CORRECTION,
+                null, SuggestedWordInfo.NOT_AN_INDEX, SuggestedWordInfo.NOT_A_CONFIDENCE));
     }
 
     // Retrieves suggestions for the batch input

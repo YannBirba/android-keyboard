@@ -2763,15 +2763,23 @@ public final class InputLogic {
      */
     private void commitChosenWord(final SettingsValues settingsValues, final String chosenWord,
             final int commitType, final String separatorString, final int importance) {
+        final String mergedWord = computeElisionMerge(settingsValues, chosenWord);
+        final String wordToCommit = mergedWord != null ? mergedWord : chosenWord;
         long startTimeMillis = 0;
         if (DebugFlags.DEBUG_ENABLED) {
             startTimeMillis = System.currentTimeMillis();
-            Log.d(TAG, "commitChosenWord() : [" + chosenWord + "]");
+            Log.d(TAG, "commitChosenWord() : [" + wordToCommit + "]");
+        }
+        if (mergedWord != null) {
+            // The previous committed word was a single apostrophe-taking letter
+            // ("n" in "il n y a rien"): remove the letter and its separator from
+            // the field, then commit the elided form ("n'y") in one go.
+            mConnection.deleteTextBeforeCursor(mLastComposedWord.mCommittedWord.length() + 1);
         }
         final SuggestedWords suggestedWords = mSuggestedWords;
         // TODO: Locale should be determined based on context and the text given.
         final Locale locale = getDictionaryFacilitatorLocale();
-        final CharSequence chosenWordWithSuggestions = chosenWord;
+        final CharSequence chosenWordWithSuggestions = wordToCommit;
         // b/21926256
         //      SuggestionSpanUtils.getTextWithSuggestionSpan(mLatinIME, chosenWord,
         //                suggestedWords, locale);
@@ -2801,8 +2809,8 @@ public final class InputLogic {
             startTimeMillis = System.currentTimeMillis();
         }
         // Add the word to the user history dictionary
-        mDictionaryFacilitator.onWordCommitted(chosenWord);
-        performAdditionToUserHistoryDictionary(settingsValues, chosenWord, ngramContext, importance);
+        mDictionaryFacilitator.onWordCommitted(wordToCommit);
+        performAdditionToUserHistoryDictionary(settingsValues, wordToCommit, ngramContext, importance);
         if (DebugFlags.DEBUG_ENABLED) {
             long runTimeMillis = System.currentTimeMillis() - startTimeMillis;
             Log.d(TAG, "commitChosenWord() : " + runTimeMillis + " ms to run "
@@ -2821,6 +2829,41 @@ public final class InputLogic {
                     + "WordComposer.commitWord()");
             startTimeMillis = System.currentTimeMillis();
         }
+    }
+
+    /**
+     * Single letters that systematically take an apostrophe in French ("n'y",
+     * "j'étais", "l'école", "d'abord", "c'est", "s'il"). When the previous
+     * committed word is exactly one of these and the current word is being
+     * committed, the two are merged into a single elided word and the
+     * previously committed separator is removed from the field.
+     *
+     * @return the merged word ({@code "'"}-joined) or {@code null} when the
+     *         merge does not apply.
+     */
+    private String computeElisionMerge(final SettingsValues settingsValues,
+            final String chosenWord) {
+        if (chosenWord == null || chosenWord.isEmpty()
+                || !settingsValues.mLocale.getLanguage().equals("fr")
+                && !getDictionaryFacilitatorLocale().getLanguage().equals("fr")) {
+            return null;
+        }
+        final LastComposedWord previous = mLastComposedWord;
+        if (previous == null || previous.mCommittedWord == null
+                || previous.mCommittedWord.length() != 1
+                || !Constants.STRING_SPACE.equals(previous.mSeparatorString)) {
+            return null;
+        }
+        final char prefix = Character.toLowerCase(
+                previous.mCommittedWord.charAt(0));
+        if ("jnldcs".indexOf(prefix) < 0) {
+            return null;
+        }
+        if (!Character.isLetter(chosenWord.charAt(0))
+                || chosenWord.charAt(0) == '\'') {
+            return null;
+        }
+        return previous.mCommittedWord.charAt(0) + "'" + chosenWord;
     }
 
     /**

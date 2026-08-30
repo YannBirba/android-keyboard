@@ -371,6 +371,11 @@ public class LanguageModelFacilitator(
         val locale = dictionaryFacilitator.primaryLocale ?: return null
         val wordComposer = inputLogic.mWordComposer ?: return null
 
+        val activeLocale = dictionaryFacilitator.mostConfidentLocale
+        if(activeLocale.language == "fr") {
+            addFrenchHomographCorrections(suggestionResults, values)
+        }
+
         val suggestedWords = Suggest.obtainNonBatchedInputSuggestedWords(
             wordComposer,
             values.inputStyle,
@@ -399,6 +404,42 @@ public class LanguageModelFacilitator(
 
 
         return suggestedWords
+    }
+
+    /**
+     * French homograph correction (see [org.futo.inputmethod.latin.xlm.FrenchHomographRules]).
+     *
+     * For the unambiguous French cases (typed "a" after a motion verb, typed "ou" after a
+     * location verb) the native beam search often fails to surface the accented homograph
+     * (à / où). We inject a high-priority whitelist suggestion so the keyboard auto-corrects
+     * to the accented form on separator. The rule is conservative and one-directional: it
+     * only ever adds a suggestion, so "il a", "thé ou café", etc. are untouched.
+     *
+     * Gated on the *active* (most confident) locale, matching how the transformer model is
+     * selected elsewhere in this class — the first dictionary group (primaryLocale) can be a
+     * different language on multi-language keyboards.
+     */
+    private fun addFrenchHomographCorrections(
+        suggestionResults: SuggestionResults,
+        values: PredictionInputValues
+    ) {
+        val typedWord = values.composedData.mTypedWord
+        val prevWordList = values.ngramContext.extractPrevWordsContextArray()
+        if (prevWordList.isEmpty()) return
+        val accentedTarget = FrenchHomographRules.apply(typedWord, prevWordList) ?: return
+
+        suggestionResults.add(
+            SuggestedWordInfo(
+                accentedTarget,
+                values.ngramContext.extractPrevWordsContext(),
+                Int.MAX_VALUE,
+                SuggestedWordInfo.KIND_WHITELIST or
+                    SuggestedWordInfo.KIND_FLAG_APPROPRIATE_FOR_AUTO_CORRECTION,
+                null,
+                0,
+                0
+            )
+        )
     }
 
     public suspend fun destroyModel() {
