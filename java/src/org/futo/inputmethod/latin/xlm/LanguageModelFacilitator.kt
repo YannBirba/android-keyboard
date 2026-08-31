@@ -31,6 +31,7 @@ import org.futo.inputmethod.latin.uix.SettingsKey
 import org.futo.inputmethod.latin.uix.USE_TRANSFORMER_FINETUNING
 import org.futo.inputmethod.latin.uix.getSetting
 import org.futo.inputmethod.latin.utils.SuggestionResults
+import java.text.Normalizer
 import kotlin.math.ceil
 
 
@@ -138,6 +139,14 @@ public class LanguageModelFacilitator(
 ) {
     private val TAG = "LanguageModelFacilitator"
     private val userDictionary = UserDictionaryObserver(context)
+
+    /**
+     * Case-and-diacritic-insensitive comparison basis: decompose to canonical base letters
+     * (NFD) then drop all combining marks, lowercasing first. Generic across languages —
+     * no hard-coded accent map (unlike the native Latin-only normalizer).
+     */
+    private fun accentAndCaseFold(s: String?): String? =
+        s?.let { Normalizer.normalize(it.lowercase(), Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "") }
 
     private var languageModel: LanguageModel? = null
     data class PredictionInputValues(
@@ -311,6 +320,22 @@ public class LanguageModelFacilitator(
             autocorrectWord = clone
             suggestionResults.add(clone)
             filtered.add(maxWordDict)
+        }
+        // When the LM and dictionary disagree only by diacritics (and cased stays equal after
+        // stripping accents), prefer the LM form: it has access to the full sentence context while
+        // the dictionary is limited to a few typed characters. E.g. the dictionary may return
+        // history word "a" while the LM predicts "à"; these agree modulo diacritics, so we keep "à".
+        val bothAlgorithmsAgreeModuloDiacritics = !bothAlgorithmsCameToSameConclusion
+                && !bothAlgorithmsCameToSameConclusionButLowerCased
+                && maxWord != null && maxWordDict != null
+                && accentAndCaseFold(maxWord.mWord) == accentAndCaseFold(maxWordDict.mWord)
+        if(bothAlgorithmsAgreeModuloDiacritics) {
+            if(BuildConfig.DEBUG) Log.d(TAG, "both algorithms agree modulo diacritics, autocorrect to ${maxWord.mWord}")
+            val clone = maxWord.scoreAtLeast(maxWordDict)
+            autocorrectWord = clone
+            suggestionResults.add(clone)
+            filtered.add(maxWordDict)
+            filtered.add(maxWord)
         }
 
         if(transformerWeight <= 0.0f) {
