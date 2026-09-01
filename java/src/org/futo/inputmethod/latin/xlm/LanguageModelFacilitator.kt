@@ -148,6 +148,9 @@ public class LanguageModelFacilitator(
     private fun accentAndCaseFold(s: String?): String? =
         s?.let { Normalizer.normalize(it.lowercase(), Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "") }
 
+    private fun stripLeadingApostrophes(s: String?): String? =
+        s?.trimStart('\'', '\u2018', '\u2019')
+
     private var languageModel: LanguageModel? = null
     data class PredictionInputValues(
         val composedData: ComposedData,
@@ -325,13 +328,35 @@ public class LanguageModelFacilitator(
         // stripping accents), prefer the LM form: it has access to the full sentence context while
         // the dictionary is limited to a few typed characters. E.g. the dictionary may return
         // history word "a" while the LM predicts "à"; these agree modulo diacritics, so we keep "à".
+        // The LM's top candidate can carry a tokenizer apostrophe artifact (e.g. "'à" / "’à"),
+        // so strip leading apostrophes before comparing and before committing the word.
+        val lmWordFold = accentAndCaseFold(stripLeadingApostrophes(maxWord?.mWord))
+        val dictWordFold = accentAndCaseFold(stripLeadingApostrophes(maxWordDict?.mWord))
         val bothAlgorithmsAgreeModuloDiacritics = !bothAlgorithmsCameToSameConclusion
                 && !bothAlgorithmsCameToSameConclusionButLowerCased
                 && maxWord != null && maxWordDict != null
-                && accentAndCaseFold(maxWord.mWord) == accentAndCaseFold(maxWordDict.mWord)
+                && !lmWordFold.isNullOrEmpty()
+                && lmWordFold == dictWordFold
         if(bothAlgorithmsAgreeModuloDiacritics) {
-            if(BuildConfig.DEBUG) Log.d(TAG, "both algorithms agree modulo diacritics, autocorrect to ${maxWord.mWord}")
-            val clone = maxWord.scoreAtLeast(maxWordDict)
+            // Commit the clean (apostrophe-stripped) LM form so we never insert a stray "'"
+            // or "’" into the text (e.g. "'à" should commit as "à").
+            val cleanWord = stripLeadingApostrophes(maxWord.mWord) ?: maxWord.mWord
+            if(BuildConfig.DEBUG) Log.d(TAG, "both algorithms agree modulo diacritics, autocorrect to $cleanWord")
+            val clone = if(cleanWord == maxWord.mWord) {
+                maxWord.scoreAtLeast(maxWordDict)
+            } else {
+                val stripped = SuggestedWordInfo(
+                    cleanWord,
+                    maxWord.mPrevWordsContext,
+                    maxWord.mScore.coerceAtLeast(maxWordDict.mScore + 1),
+                    SuggestedWordInfo.KIND_WHITELIST or SuggestedWordInfo.KIND_FLAG_APPROPRIATE_FOR_AUTO_CORRECTION,
+                    maxWord.mSourceDict,
+                    0,
+                    0
+                )
+                stripped.mOriginatesFromTransformerLM = maxWord.mOriginatesFromTransformerLM
+                stripped
+            }
             autocorrectWord = clone
             suggestionResults.add(clone)
             filtered.add(maxWordDict)
