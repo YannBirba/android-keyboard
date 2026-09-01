@@ -180,6 +180,14 @@ public class LanguageModelFacilitator(
         }
     }
 
+    // Remember the LM's top next-word prediction from the last empty-composer run. When composing
+    // the following word the compose-time LM can be clueless (all -100000), but the next-word
+    // prediction from right after the previous space is reliable and carries sentence context.
+    // We only fall back to it if it disagrees with the typed word only by diacritics/case, e.g.
+    // after "il va" the LM predicts "à" as next word, so typing "a" should autocorrect to "à".
+    // Negatives are safe: after "il" / "elle" the LM predicts "y"/"est"/"a", never "à".
+    private var cachedNextWordLm: SuggestedWordInfo? = null
+
     private var skipLanguage: String? = null
     private suspend fun runLanguageModel(values: PredictionInputValues): ArrayList<SuggestedWordInfo>? {
         if(transformerDisabled) return null
@@ -273,6 +281,10 @@ public class LanguageModelFacilitator(
 
         val maxWord = reweightedSuggestions.maxByOrNull { it.mScore }
 
+        if(values.composedData.mTypedWord.isEmpty() && maxWord != null && maxWord.mScore > 0) {
+            cachedNextWordLm = maxWord
+        }
+
         val suggestedWordsDictList = suggestedWordsDict.mSuggestedWordInfoList.filter {
             suggestionBlacklist.isSuggestedWordOk(it)
         }.toMutableList()
@@ -332,16 +344,30 @@ public class LanguageModelFacilitator(
         // so strip leading apostrophes before comparing and before committing the word.
         val lmWordFold = accentAndCaseFold(stripLeadingApostrophes(maxWord?.mWord))
         val dictWordFold = accentAndCaseFold(stripLeadingApostrophes(maxWordDict?.mWord))
+        // The compose-time LM is sometimes clueless (all scores -100000, empty top word). In that
+        // case fall back to the last empty-composer next-word prediction, which is reliable and
+        // carries the full sentence context (e.g. after "il va" the LM predicts "à" as next word,
+        // so typing "a" autocorrects to "à"). Only fire when the cached word actually differs from
+        // the typed word by diacritics/case — after "il"/"elle" the LM predicts "y"/"est"/"a",
+        // never "à", so the negatives ("il a peur", "elle a vu") stay untouched.
+        val cachedNextWordFold = accentAndCaseFold(stripLeadingApostrophes(cachedNextWordLm?.mWord))
+        val lmAgreesViaCompose = !lmWordFold.isNullOrEmpty() && lmWordFold == dictWordFold
+        val lmAgreesViaNextWord = lmWordFold.isNullOrEmpty()
+                && !cachedNextWordFold.isNullOrEmpty()
+                && cachedNextWordFold == dictWordFold
+                && cachedNextWordLm?.mWord != values.composedData.mTypedWord
         val bothAlgorithmsAgreeModuloDiacritics = !bothAlgorithmsCameToSameConclusion
                 && !bothAlgorithmsCameToSameConclusionButLowerCased
                 && maxWord != null && maxWordDict != null
-                && !lmWordFold.isNullOrEmpty()
-                && lmWordFold == dictWordFold
+                && maxWordDict.mWord != values.composedData.mTypedWord
+                && (lmAgreesViaCompose || lmAgreesViaNextWord)
         if(bothAlgorithmsAgreeModuloDiacritics) {
             // Commit the clean (apostrophe-stripped) LM form so we never insert a stray "'"
             // or "’" into the text (e.g. "'à" should commit as "à").
-            val cleanWord = stripLeadingApostrophes(maxWord.mWord) ?: maxWord.mWord
-            if(BuildConfig.DEBUG) Log.d(TAG, "both algorithms agree modulo diacritics, autocorrect to $cleanWord")
+            val cleanWord = stripLeadingApostrophes(
+                if(lmAgreesViaCompose) maxWord.mWord else cachedNextWordLm?.mWord
+            ) ?: maxWord.mWord
+            if(BuildConfig.DEBUG) Log.d(TAG, "both algorithms agree modulo diacritics, autocorrect to $cleanWord${if(lmAgreesViaNextWord) " (via cached next word)" else ""}")
             val clone = if(cleanWord == maxWord.mWord) {
                 maxWord.scoreAtLeast(maxWordDict)
             } else {
