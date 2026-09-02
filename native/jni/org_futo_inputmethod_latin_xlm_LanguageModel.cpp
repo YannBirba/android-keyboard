@@ -4,6 +4,8 @@
 
 #include <cstring> // for memset()
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 #include "jni.h"
 #include "jni_common.h"
@@ -1018,7 +1020,6 @@ namespace latinime {
         }
 
 
-        // TODO: Transform here
         llama_context *ctx = state->model->context();
         size_t n_vocab = llama_n_vocab(llama_get_model(ctx));
 
@@ -1026,26 +1027,127 @@ namespace latinime {
         next_context.insert(next_context.begin(), 1); // BOS
 
         auto decoding_result = state->DecodePromptAndMixes(next_context, { });
-        float *logits = llama_get_logits_ith(ctx, decoding_result.logits_head);
-
-        softmax(logits, n_vocab);
-
-        AKLOGI("Iter");
-        for(auto &entry : words) {
-            float pseudoScore = logits[entry.tokens[0]] / (float)entry.tokens.size();
-            AKLOGI("Word [%s], %d tokens, prob[0] = %.8f", entry.word.c_str(), entry.tokens.size(), pseudoScore);
-            entry.transformedScore *= pseudoScore * 1000.0f;
+        if(decoding_result.logits_head < 0) {
+            // No prompt was decoded (empty context); leave the original scores untouched.
+            jint *outArray = env->GetIntArrayElements(outScores, nullptr);
+            for(const auto &entry : words) outArray[entry.index] = entry.originalScore;
+            env->ReleaseIntArrayElements(outScores, outArray, 0);
+            return;
         }
-        // TODO: Transform here
+
+        // The probability of a candidate word is the product of the conditional
+        // probabilities of each of its tokens given the suffix context and the
+        // previously generated tokens of the word itself:
+        //   P(word) = P(tok_0 | ctx) * P(tok_1 | ctx, tok_0) * ...
+        // The old code only scored the first token and then merely divided by the
+        // token count, which systematically favoured short words and ignored all
+        // tokens after the first one — useless for inflected forms like "mangé" or
+        // "travaillent" that often span multiple tokens.
+        //
+        // We decode the context once on seq 0, replicate the KV cache onto a fresh
+        // seq_id per candidate word (like Sample does), then step the word tokens
+        // forward one at a time, accumulating log-probabilities along the way.
+        size_t maxTokens = 0;
+        for(const auto &entry : words) maxTokens = std::max(maxTokens, entry.tokens.size());
+
+        std::vector<float> logProb(words.size(), 0.0f);
+
+        // First token: P(tok_0 | ctx)
+        float *headLogits = llama_get_logits_ith(ctx, decoding_result.logits_head);
+        softmax(headLogits, n_vocab);
+        for(size_t i = 0; i < words.size(); i++) {
+            const auto &entry = words[i];
+            if(entry.tokens.empty()) {
+                logProb[i] = -INFINITY;
+            } else {
+                logProb[i] = logf(std::max(headLogits[entry.tokens[0]], 1e-8f));
+            }
+        }
+
+        for(size_t i = 1; i < words.size(); i++) {
+            llama_kv_cache_seq_cp(ctx, 0, (llama_seq_id)i, 0, (llama_pos)decoding_result.size);
+        }
+
+        llama_batch batch = state->model->adapter->batch;
+
+        std::vector<int> slotToWord;
+        slotToWord.reserve(words.size());
+
+        for(size_t tok = 1; tok < maxTokens; tok++) {
+            batch.n_tokens = 0;
+            slotToWord.clear();
+
+            for(size_t i = 0; i < words.size(); i++) {
+                const auto &entry = words[i];
+                if(entry.tokens.size() <= tok) continue; // word already fully scored
+
+                int slot = batch.n_tokens;
+                batch.token[slot] = entry.tokens[tok - 1];
+                batch.pos[slot] = (llama_pos)(decoding_result.size + tok - 1);
+                batch.seq_id[slot][0] = (llama_seq_id)i;
+                batch.n_seq_id[slot] = 1;
+                batch.logits[slot] = true;
+                batch.n_tokens++;
+                slotToWord.push_back((int)i);
+            }
+
+            if(batch.n_tokens == 0) break;
+
+            if (llama_decode(ctx, batch) != 0) {
+                AKLOGE("llama_decode() failed in rescoreSuggestions");
+                break;
+            }
+
+            for(int slot = 0; slot < batch.n_tokens; slot++) {
+                int wi = slotToWord[slot];
+                const auto &entry = words[wi];
+                float *stepLogits = llama_get_logits_ith(ctx, slot);
+                softmax(stepLogits, n_vocab);
+                logProb[wi] += logf(std::max(stepLogits[entry.tokens[tok]], 1e-8f));
+            }
+        }
+
+        // Convert the accumulated log-probability into a score. To make scores
+        // comparable between words of different lengths we use the geometric mean
+        // probability per token (exp of the mean log-probability).
+        for(auto &entry : words) {
+            if(entry.tokens.empty()) continue;
+
+            int wi = (int)(&entry - &words[0]);
+            float meanLogProb = logProb[wi] / (float)entry.tokens.size();
+            float perTokenProb = expf(std::min(0.0f, meanLogProb));
+
+            // Scale the per-token probability (values in roughly 0..1) into an
+            // int score range. We keep a small floor so that a dict score still
+            // wins when the LM has no strong opinion (all perTokenProb ~equal).
+            entry.transformedScore = (jint)(
+                std::clamp(perTokenProb, 0.0f, 1.0f) * 900000000.0f
+                + entry.transformedScore * 100000.0f
+            );
+        }
 
         // Output scores
         jint *outArray = env->GetIntArrayElements(outScores, nullptr);
 
         for(const auto &entry : words) {
-            outArray[entry.index] = (jint)(entry.transformedScore * (maxScore - minScore) + minScore);
+            outArray[entry.index] = (jint)entry.transformedScore;
         }
 
         env->ReleaseIntArrayElements(outScores, outArray, 0);
+
+        // Clean up the per-candidate KV-cache sequences we created (seq 1..words.size()-1)
+        // so they don't linger and confuse subsequent Sample/real-prediction calls, which
+        // only clean seq 1..n_results-1.
+        if(words.size() > 1) {
+            for(size_t i = 1; i < words.size(); i++) {
+                llama_kv_cache_seq_rm(ctx, (llama_seq_id)i, 0, -1);
+            }
+        }
+
+        AKLOGI("rescoreSuggestions context=[%s]", contextString.c_str());
+        for(const auto &entry : words) {
+            AKLOGI("rescore word [%s] %d tokens logP=%.4f score=%d", entry.word.c_str(), (int)entry.tokens.size(), logProb[&entry - &words[0]], (jint)entry.transformedScore);
+        }
     }
 
     static void xlm_LanguageModel_getSuggestions(JNIEnv *env, jclass clazz,
